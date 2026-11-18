@@ -3,3 +3,4 @@ __pycache__/
 .live_state.json*
 vista_previa_vigilada.png
 coordenadas.txt
+debug/

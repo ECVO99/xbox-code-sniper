@@ -6,11 +6,45 @@ import re
 import subprocess
 import sys
 import time
+import traceback
 import winsound
+from pathlib import Path
+
+# ==============================================================================
+# 0. DIAGNÓSTICO EN CONSOLA
+# ==============================================================================
+DEBUG = True                 # Pon False para desactivar los mensajes de diagnóstico
+INTERVALO_ESTADO_SEG = 3.0   # Cada cuánto imprimir el estado del OCR
+
+# Qué pantalla vigilar:
+#   "todos"     -> todos los monitores a la vez (recomendado con 2+ pantallas)
+#   "principal" -> solo el monitor principal de Windows
+#   1, 2, ...   -> un monitor concreto según la lista "Monitor mss[i]" que sale al arrancar
+MONITOR_A_VIGILAR = "todos"
+CARPETA_DEBUG = Path(__file__).resolve().parent / "debug"
+_T0 = time.perf_counter()
+
+
+def enmascarar(codigo_fmt: str) -> str:
+    """Nunca imprimir un código completo: el OCR lo leería de la propia consola y lo canjearía mal."""
+    g = re.split(r"[-\s]", codigo_fmt)
+    if len(g) == 5:
+        return f"{g[0]}-•••••-•••••-•••••-{g[4]}"
+    return codigo_fmt[:5] + "…"
+
+
+RE_LINEA_DE_LOG = re.compile(r"(\[\s*(INFO|WARN|DBG|ERROR)\s*\]|^\W*\d+[.,]\S*s\s*\]|CANJEADO|detectado en)", re.IGNORECASE)
+
+
+def log(nivel: str, msg: str):
+    if nivel == "DBG" and not DEBUG:
+        return
+    print(f"[{time.perf_counter() - _T0:8.2f}s] [{nivel}] {msg}")
 
 # Auto-instalador automático en el primer arranque (solo necesitas este único archivo)
 try:
     import mss
+    import mss.tools
     import mss.windows.gdi as mss_gdi
     from winrt.windows.globalization import Language
     from winrt.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
@@ -20,6 +54,7 @@ except ImportError:
     print("[⚙] Instalando librerías necesarias por única vez...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "mss", "winocr"])
     import mss
+    import mss.tools
     import mss.windows.gdi as mss_gdi
     from winrt.windows.globalization import Language
     from winrt.windows.graphics.imaging import BitmapPixelFormat, SoftwareBitmap
@@ -33,13 +68,16 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
 
 # Precisión DPI para que las coordenadas coincidan en cualquier pantalla (100%, 125%, 150%)
+DPI_MODO = "ninguno"
 try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
-except Exception:
+    _r = ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    DPI_MODO = f"PerMonitor (SetProcessDpiAwareness=2, retorno={_r})"
+except Exception as _e:
     try:
         ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
+        DPI_MODO = "SystemAware (SetProcessDPIAware)"
+    except Exception as _e2:
+        DPI_MODO = f"FALLÓ ({_e} / {_e2})"
 
 # ==============================================================================
 # 1. CLIC Y TECLEO DIRECTO POR HARDWARE WIN32 (Sin usar portapapeles, < 1 ms)
@@ -119,21 +157,27 @@ def _enviar_inputs(*eventos: INPUT) -> int:
 
 
 def clic_nativo(x: int, y: int) -> int:
-    screen_w = max(user32.GetSystemMetrics(0), 1920)
-    screen_h = max(user32.GetSystemMetrics(1), 1200)
-    abs_x = int(int(x) * 65535 / (screen_w - 1))
-    abs_y = int(int(y) * 65535 / (screen_h - 1))
+    # Funciona con cualquier resolución/relación de aspecto (16:9, 21:9, 32:9, multi-monitor):
+    # se posiciona el cursor en píxeles reales y el clic se envía SIN coordenadas absolutas,
+    # evitando la conversión a la escala 0-65535 que dependía del tamaño de pantalla.
+    ok_pos = user32.SetCursorPos(int(x), int(y))
+    pt = wintypes.POINT()
+    user32.GetCursorPos(ctypes.byref(pt))
 
-    user32.SetCursorPos(int(x), int(y))
-
-    move = INPUT(type=INPUT_MOUSE)
-    move.union.mi = MOUSEINPUT(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, 0, 0)
     down = INPUT(type=INPUT_MOUSE)
-    down.union.mi = MOUSEINPUT(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTDOWN, 0, 0)
+    down.union.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTDOWN, 0, 0)
     up = INPUT(type=INPUT_MOUSE)
-    up.union.mi = MOUSEINPUT(abs_x, abs_y, 0, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_LEFTUP, 0, 0)
+    up.union.mi = MOUSEINPUT(0, 0, 0, MOUSEEVENTF_LEFTUP, 0, 0)
 
-    return _enviar_inputs(move, down, up)
+    n = _enviar_inputs(down, up)
+    desfase = abs(pt.x - int(x)) + abs(pt.y - int(y))
+    log("DBG", f"Clic pedido en ({x},{y}) -> cursor quedó en ({pt.x},{pt.y}) | SetCursorPos={ok_pos} | eventos={n}/2")
+    if not ok_pos or desfase > 2:
+        log("WARN", "El cursor NO quedó donde se pidió. Revisa escalado de Windows / monitor principal.")
+    if n == 0:
+        log("ERROR", f"SendInput bloqueado (GetLastError={ctypes.GetLastError()}). "
+                     "Ejecuta desde CMD/PowerShell normal y NO como admin si el navegador no es admin (o ambos como admin).")
+    return n
 
 
 def escribir_codigo_directo(coord, codigo_25: str) -> int:
@@ -166,6 +210,9 @@ def escribir_codigo_directo(coord, codigo_25: str) -> int:
 
     time.sleep(0.015)
     enviados += _enviar_inputs(_key_event(VK_RETURN, False), _key_event(VK_RETURN, True))
+    esperados = 25 * 2 + 2
+    nivel = "DBG" if enviados >= esperados else "WARN"
+    log(nivel, f"Teclas enviadas: {enviados}/{esperados}")
     return enviados
 
 
@@ -238,7 +285,11 @@ PATRON_XBOX_5X5 = re.compile(
     re.IGNORECASE,
 )
 
-RE_PLACEHOLDER_INPUT = re.compile(r"(escrib[ea]\s+el\s+c\S*digo\s+de\s+25|enter\s+.*25-character)", re.IGNORECASE)
+# Tolera errores típicos del OCR: "eI", "e1", "e|", "códiqo", "2S"... Debe empezar la línea con "Escribe"
+# para no confundirse con la descripción "...escribe tu código de 25 caracteres en el espacio siguiente".
+RE_PLACEHOLDER_INPUT = re.compile(
+    r"^\W*escrib\S*\s+e[lI1|!]\s+c\S*di\S*\s+de\s+2[5S]|enter\s+.*25-character", re.IGNORECASE
+)
 RE_COMO_ESTE_BAJO_INPUT = re.compile(r"^(como\s+este|like\s+this)\s*:", re.IGNORECASE)
 RE_ETIQUETA_ARRIBA_INPUT = re.compile(r"^se\s+agregar\S*\s+a\s+\S+@", re.IGNORECASE)
 RE_BOTON_SIGUIENTE = re.compile(r"^(siguiente|sibuien\S*|siguien\S*|next)$", re.IGNORECASE)
@@ -274,6 +325,8 @@ def detectar_codigos_en_lineas(lineas, casilla_xbox_coord=None):
 
         if any(m in txt for m in ("HTTP", "WWW.", ".COM", "UTM_", "=", "&", "?", "COPY-LINK")):
             continue
+        if RE_LINEA_DE_LOG.search(item["text"]):
+            continue  # Es la consola de este mismo script
 
         if casilla_xbox_coord and abs(cx - casilla_xbox_coord[0]) < 240 and abs(cy - casilla_xbox_coord[1]) < 42:
             continue
@@ -354,6 +407,20 @@ def localizar_ui_xbox_dinamica(lineas):
 # ==============================================================================
 # 4. BUCLE PRINCIPAL (UN SOLO ARCHIVO, 100% AUTOMÁTICO)
 # ==============================================================================
+def _guardar_diagnostico(sct, s, lineas, etiqueta: str):
+    try:
+        CARPETA_DEBUG.mkdir(exist_ok=True)
+        png = CARPETA_DEBUG / f"{etiqueta}.png"
+        txt = CARPETA_DEBUG / f"{etiqueta}_ocr.txt"
+        mss.tools.to_png(s.rgb, s.size, output=str(png))
+        with open(txt, "w", encoding="utf-8") as f:
+            for it in lineas:
+                f.write(f"({it['x']},{it['y']}) w={it['w']} h={it['h']} centro=({it['cx']},{it['cy']}) | {it['text']}\n")
+        log("INFO", f"Diagnóstico guardado: {png.name} y {txt.name} en {CARPETA_DEBUG}")
+    except Exception as e:
+        log("WARN", f"No se pudo guardar diagnóstico: {e}")
+
+
 def main():
     print("=" * 72)
     print("  🚀 SNIPER XBOX 100% DINÁMICO (ARCHIVO ÚNICO - CERO CALIBRACIÓN)")
@@ -362,17 +429,77 @@ def main():
     print("  2. El bot localiza solo la casilla de Xbox y escribe el código al instante.")
     print("=" * 72)
 
+    # ---------- Validaciones de arranque ----------
+    log("INFO", f"Python {sys.version.split()[0]} | DPI: {DPI_MODO}")
+    try:
+        es_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        es_admin = None
+    log("INFO", f"Ejecutando como administrador: {es_admin}")
+    log("INFO", f"GetSystemMetrics pantalla principal: {user32.GetSystemMetrics(0)}x{user32.GetSystemMetrics(1)} | "
+                f"escritorio virtual: {user32.GetSystemMetrics(78)}x{user32.GetSystemMetrics(79)}")
+
     ocr = FastWindowsOCR(lang_tag="es")
+    if ocr.engine is None:
+        log("ERROR", "No se pudo crear el motor OCR de Windows. Instala el paquete de idioma Español "
+                     "(Configuración > Hora e idioma > Idioma) con 'Reconocimiento óptico de caracteres'.")
+        return
+    try:
+        log("INFO", f"Idioma OCR: {ocr.engine.recognizer_language.language_tag} | "
+                    f"Tamaño máx. imagen OCR: {OcrEngine.max_image_dimension}px")
+    except Exception:
+        pass
     ocr.recognize_with_boxes(bytes(64 * 64 * 4), 64, 64)
 
-    sct = mss.MSS()
-    monitor = sct.monitors[1]
+    sct = mss.MSS() if hasattr(mss, "MSS") else mss.mss()
+    for i, m in enumerate(sct.monitors):
+        log("INFO", f"Monitor mss[{i}]{' (todos)' if i == 0 else ''}: {m['width']}x{m['height']} en ({m['left']},{m['top']})")
+    if MONITOR_A_VIGILAR == "todos":
+        idx = 0
+    elif MONITOR_A_VIGILAR == "principal":
+        idx = next((i for i, m in enumerate(sct.monitors[1:], 1) if m["left"] == 0 and m["top"] == 0), 1)
+    else:
+        idx = int(MONITOR_A_VIGILAR)
+        if not 0 <= idx < len(sct.monitors):
+            log("ERROR", f"MONITOR_A_VIGILAR={idx} no existe. Usando todos.")
+            idx = 0
+    monitor = sct.monitors[idx]
+    principal = next((i for i, m in enumerate(sct.monitors[1:], 1) if m["left"] == 0 and m["top"] == 0), None)
+    log("INFO", f"Monitor principal de Windows: mss[{principal}]")
+    log("INFO", f"Monitor capturado: mss[{idx}]{' (todos)' if idx == 0 else ''} {monitor['width']}x{monitor['height']} "
+                f"desde ({monitor['left']},{monitor['top']}) (proporción {monitor['width'] / monitor['height']:.2f}:1)")
+    try:
+        max_dim = OcrEngine.max_image_dimension
+        if max(monitor["width"], monitor["height"]) > max_dim:
+            log("ERROR", f"La captura ({monitor['width']}px) supera el máximo del OCR ({max_dim}px).")
+    except Exception:
+        pass
+
+    # Prueba inicial: captura + OCR + guardado
+    t = time.perf_counter()
+    s0 = sct.grab(monitor)
+    lin0 = ocr.recognize_with_boxes(s0.raw, s0.width, s0.height, monitor["left"], monitor["top"])
+    log("INFO", f"Prueba OCR: {len(lin0)} líneas leídas en {(time.perf_counter() - t) * 1000:.0f} ms")
+    in0, sig0, conf0 = localizar_ui_xbox_dinamica(lin0)
+    log("INFO" if in0 else "WARN", f"Casilla Xbox: {in0 or 'NO ENCONTRADA'} | Siguiente: {sig0} | Confirmar: {conf0}")
+    if not in0:
+        pistas = [it["text"] for it in lin0 if re.search(r"c.digo|25|caracteres|character|canjear|redeem", it["text"], re.I)]
+        log("WARN", f"Textos parecidos a la página de Xbox vistos por el OCR: {pistas[:8] or 'ninguno'}")
+    _guardar_diagnostico(sct, s0, lin0, "arranque")
+
     codigos_procesados = set()
+    descartes_vistos = set()
     ultima_coord_xbox = None
     ultimo_btn_siguiente = None
     ultimo_raw = None
+    t_estado = time.perf_counter()
+    frames = 0
+    ms_ocr_total = 0.0
+    n_lineas = 0
+    errores = 0
 
-    print("[✔] Vigilando pantalla en vivo...\n")
+    print()
+    log("INFO", "✔ Vigilando pantalla en vivo... (Ctrl+C para detener)\n")
 
     while True:
         try:
@@ -384,52 +511,100 @@ def main():
             t_frame = time.perf_counter()
 
             lineas = ocr.recognize_with_boxes(s.raw, s.width, s.height, monitor["left"], monitor["top"])
+            frames += 1
+            ms_ocr_total += (time.perf_counter() - t_frame) * 1000.0
+            n_lineas = len(lineas)
             dyn_input, dyn_sig, _ = localizar_ui_xbox_dinamica(lineas)
 
             if dyn_input:
                 if not ultima_coord_xbox or (
                     abs(dyn_input[0] - ultima_coord_xbox[0]) > 12 or abs(dyn_input[1] - ultima_coord_xbox[1]) > 12
                 ):
-                    print(f"[🎯 CASILLA XBOX LOCALIZADA] Posición: {dyn_input} | Botón Siguiente: {dyn_sig}")
+                    log("INFO", f"🎯 CASILLA XBOX LOCALIZADA en {dyn_input} | Botón Siguiente: {dyn_sig}")
                 ultima_coord_xbox = dyn_input
             if dyn_sig:
                 ultimo_btn_siguiente = dyn_sig
 
+            # Estado periódico
+            if time.perf_counter() - t_estado >= INTERVALO_ESTADO_SEG:
+                prom = ms_ocr_total / frames if frames else 0
+                log("DBG", f"Estado: {frames} frames, OCR prom {prom:.0f} ms, {n_lineas} líneas | "
+                           f"casilla en este frame: {dyn_input or 'NO'} | última casilla: {ultima_coord_xbox} | "
+                           f"siguiente: {ultimo_btn_siguiente} | errores: {errores}")
+                t_estado = time.perf_counter()
+                frames, ms_ocr_total = 0, 0.0
+
             codigos = detectar_codigos_en_lineas(lineas, casilla_xbox_coord=ultima_coord_xbox)
+            validos = {c[0] for c in codigos}
+
+            # Candidatos que parecen código pero no pasaron el filtro
+            for it in lineas:
+                compacto = re.sub(r"[^A-Za-z0-9]", "", it["text"])
+                mayus = sum(1 for c in compacto if c.isupper() or c.isdigit())
+                if RE_LINEA_DE_LOG.search(it["text"]):
+                    continue
+                if len(compacto) >= 20 and mayus / len(compacto) >= 0.8 and it["text"] not in descartes_vistos and not any(v in compacto.upper().translate(TABLA_CORRECCION_XBOX) or v in compacto.upper() for v in validos):
+                    descartes_vistos.add(it["text"])
+                    log("DBG", f"Texto tipo código rechazado en ({it['cx']},{it['cy']}): empieza '{compacto[:5]}…' ({len(compacto)} alfanum.)")
+
             for c25, cfmt, pos_codigo in reversed(codigos):
-                if c25 not in codigos_procesados and ultima_coord_xbox:
-                    codigos_procesados.add(c25)
-                    n_ev = escribir_codigo_directo(ultima_coord_xbox, c25)
-                    ms = (time.perf_counter() - t_frame) * 1000.0
-                    print(f"\n⚡ [CÓDIGO DETECTADO EN {pos_codigo} -> CANJEADO EN {ms:.1f} ms (eventos={n_ev})]: {cfmt}")
+                if c25 in codigos_procesados:
+                    continue
+                if not ultima_coord_xbox:
+                    if c25 not in descartes_vistos:
+                        descartes_vistos.add(c25)
+                        log("WARN", f"Código {enmascarar(cfmt)} visto en {pos_codigo}, pero NO se ha localizado la casilla de Xbox. "
+                                    "No se escribe. Revisa debug/arranque_ocr.txt.")
+                        _guardar_diagnostico(sct, s, lineas, "codigo_sin_casilla")
+                    continue
 
-                    # Vigilar y pulsar SIGUIENTE y CONFIRMAR automáticamente
-                    for _ in range(20):
-                        time.sleep(0.14)
-                        s2 = sct.grab(monitor)
-                        lin2 = ocr.recognize_with_boxes(s2.raw, s2.width, s2.height, monitor["left"], monitor["top"])
-                        _, sig2, conf2 = localizar_ui_xbox_dinamica(lin2)
-                        if conf2:
-                            clic_nativo(conf2[0], conf2[1])
-                            presionar_enter_nativo()
-                            print(f"   [✔ AUTO-CONFIRMAR] Botón 'CONFIRMAR' pulsado en {conf2}!")
-                            break
-                        target_sig = sig2 or ultimo_btn_siguiente
-                        if target_sig:
-                            clic_nativo(target_sig[0], target_sig[1])
+                codigos_procesados.add(c25)
+                log("INFO", f"Código {enmascarar(cfmt)} visto en {pos_codigo}. Escribiendo en casilla {ultima_coord_xbox}...")
+                n_ev = escribir_codigo_directo(ultima_coord_xbox, c25)
+                ms = (time.perf_counter() - t_frame) * 1000.0
+                log("INFO", f"⚡ Escrito en {ms:.1f} ms (eventos={n_ev}): {enmascarar(cfmt)}")
 
-                    try:
-                        winsound.MessageBeep(winsound.MB_ICONASTERISK)
-                    except Exception:
-                        pass
-                    ultimo_raw = None
-                    break
+                # Vigilar y pulsar SIGUIENTE y CONFIRMAR automáticamente
+                confirmado = False
+                for intento in range(20):
+                    time.sleep(0.14)
+                    s2 = sct.grab(monitor)
+                    lin2 = ocr.recognize_with_boxes(s2.raw, s2.width, s2.height, monitor["left"], monitor["top"])
+                    _, sig2, conf2 = localizar_ui_xbox_dinamica(lin2)
+                    log("DBG", f"  Intento {intento + 1}/20: Siguiente={sig2} Confirmar={conf2}")
+                    if conf2:
+                        clic_nativo(conf2[0], conf2[1])
+                        presionar_enter_nativo()
+                        log("INFO", f"  ✔ AUTO-CONFIRMAR: botón 'CONFIRMAR' pulsado en {conf2}")
+                        confirmado = True
+                        break
+                    target_sig = sig2 or ultimo_btn_siguiente
+                    if target_sig:
+                        clic_nativo(target_sig[0], target_sig[1])
+                    elif intento == 0:
+                        log("WARN", "  No se encontró el botón SIGUIENTE ni CANCELAR en pantalla.")
+                if not confirmado:
+                    log("WARN", "  No apareció el botón CONFIRMAR tras 20 intentos.")
+                    _guardar_diagnostico(sct, s2, lin2, "sin_confirmar")
+
+                try:
+                    winsound.MessageBeep(winsound.MB_ICONASTERISK)
+                except Exception:
+                    pass
+                ultimo_raw = None
+                break
 
             time.sleep(0.005)
         except KeyboardInterrupt:
-            print("\n[⏹] Detenido.")
+            print()
+            log("INFO", "⏹ Detenido.")
             break
-        except Exception:
+        except Exception as e:
+            errores += 1
+            if errores <= 5 or errores % 50 == 0:
+                log("ERROR", f"Excepción #{errores} en el bucle: {e!r}")
+                if DEBUG:
+                    traceback.print_exc()
             time.sleep(0.02)
 
 
