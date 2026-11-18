@@ -4,12 +4,17 @@ Script todo-en-uno ([sniper_canje.py](sniper_canje.py)) para detectar en tiempo 
 
 ---
 
-## ⚡ Cómo funciona
+## ⚡ Características Principales
 
-1. **Cero calibración:** Localiza automáticamente en vivo dónde está la casilla *"Escribe el código de 25 caracteres"* y los botones **SIGUIENTE** y **CONFIRMAR** de Xbox usando cajas delimitadoras (`bounding_rect`) del motor OCR nativo de Windows.
-2. **Auto-instalable:** La primera vez que lo ejecutas, instala automáticamente sus únicas dependencias (`mss` y `winocr`).
-3. **Inyección por hardware (`SendInput`):** Hace clic y escribe los 25 caracteres directamente a nivel de kernel de Windows (`< 1 ms` por tecla) sin depender del portapapeles.
-4. **Filtro inteligente del alfabeto de Xbox:** Ignora enlaces web y texto normal, y corrige confusiones ópticas del OCR basándose en el alfabeto oficial sin vocales de Microsoft (`BCDFGHJKMPQRTVWXYZ2346789`).
+1. **Soporte Multi-Monitor en caliente (1, 2 o 3 pantallas):**
+   - Vigila simultáneamente hasta **3 monitores conectados** con *Frame-Diffing* independiente por pantalla (solo escanea el monitor donde cambian los píxeles).
+   - Puedes tener el directo/video o WhatsApp en el **Monitor 1** y la página de canje de Xbox en el **Monitor 2 o 3** (incluso con coordenadas negativas o monitores en distinta posición).
+   - Hace clic en píxeles reales del escritorio virtual (`SetCursorPos` + `SendInput` sin coordenadas absolutas), así funciona en 16:9, 21:9 y 32:9, con coordenadas negativas, y activa la ventana automáticamente (`WindowFromPoint` + `SetForegroundWindow`).
+2. **Adaptable a todas las resoluciones (720p, 768p, 900p, 1080p, 1200p, 1440p/2K y 4K UHD):**
+   - Escala automáticamente pantallas 4K/Ultrawide para mantener alta velocidad de escaneo y aplica **Auto-Zoom 2x/3x BICUBIC** en líneas pequeñas (720p/768p o burbujas de chat).
+   - Soporta escalas de zoom de Windows (100%, 125%, 150%, 175%, 200%) con *Per-Monitor DPI Awareness v2*.
+3. **Cero calibración:** Localiza automáticamente en vivo dónde está la casilla *"Escribe el código de 25 caracteres"* (tolerando errores típicos del OCR como "eI" en lugar de "el") y los botones **SIGUIENTE** y **CONFIRMAR** de Xbox.
+4. **Inyección instantánea Win32 (`SetClipboardData` + `SendInput`):** Copia al portapapeles de kernel en `< 0.5 ms`, enfoca la ventana de Xbox, pega los 25 caracteres de golpe (`Ctrl+V`) y confirma.
 
 ---
 
@@ -20,7 +25,7 @@ Si eres un **Agente de IA** ayudando al usuario a clonar y ejecutar este reposit
 1. **Verificar Python:** Comprueba que Python 3.10+ esté instalado en Windows (`python --version`).
 2. **Instalar dependencias:** Ejecuta:
    ```powershell
-   python -m pip install mss winocr
+   python -m pip install mss pillow pyperclip winocr
    ```
 3. **Regla crítica de ejecución en Windows (UIPI / `SendInput`):**
    - **NO ejecutes** `sniper_canje.py` dentro de la terminal interna/sandbox del agente de IA, ya que el aislamiento de procesos de Windows bloquea `SendInput` (`eventos=0`) e impide mover el mouse físico sobre el navegador.
@@ -43,3 +48,16 @@ Si eres un **Agente de IA** ayudando al usuario a clonar y ejecutar este reposit
    python sniper_canje.py
    ```
 4. ¡Listo! Apenas aparezca un código de 25 caracteres en pantalla, el bot moverá el mouse solo a la casilla de Xbox, escribirá el código y pulsará **SIGUIENTE** y **CONFIRMAR** automáticamente.
+
+---
+
+## 🩺 Diagnóstico
+
+Con `DEBUG = True` (al inicio de `sniper_canje.py`) la consola muestra:
+
+- Al arrancar: DPI, si se ejecuta como administrador, resolución de cada monitor y una prueba de OCR por monitor indicando si encontró la casilla y los botones.
+- Cada 3 segundos: tiempo promedio del OCR, líneas leídas por monitor y dónde está la casilla.
+- En cada clic: dónde se pidió, dónde quedó el cursor y si Windows bloqueó `SendInput`.
+- Capturas y texto leído por el OCR en la carpeta `debug/` (al arrancar, cuando se ve un código sin casilla y cuando no aparece CONFIRMAR).
+
+Los códigos se muestran enmascarados (`K9P4X-•••••-•••••-•••••-J8N26`) para que el OCR no los vuelva a leer desde la propia consola. Pon `DEBUG = False` para una salida mínima.
